@@ -1,8 +1,9 @@
 package raft
 
 import (
+	rand2 "crypto/rand"
 	"log"
-	"math/rand"
+	"math/big"
 	"time"
 )
 
@@ -127,10 +128,11 @@ func (es *Entries) appendOnly(command interface{}, currentTerm int) {
 	es.index++
 }
 
-const beatTime = 2000
+const beatTime = 200
+const SendWaitTimeout = 100 * time.Millisecond
 func getRandTime(i int) time.Duration {
-	rand.Seed(time.Now().Unix())
-	tmp := rand.Uint32() % 1000
+	rng, _ := rand2.Int(rand2.Reader, big.NewInt(200))
+	tmp := uint32(rng.Uint64())
 	tmp += beatTime
 	tmp += uint32(i)
 	return time.Duration(tmp) * time.Millisecond

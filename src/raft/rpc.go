@@ -49,7 +49,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	rf.state = 2
-	rf.timer.Reset(getRandTime(0))
+	//rf.timer.Reset(getRandTime(0))
 	rf.currentTerm = args.Term
 	rf.votedFor = args.CandidateId
 	reply.Term = rf.currentTerm
@@ -125,7 +125,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.votedFor = args.LeaderId
 		reply.Term = rf.currentTerm
 		rf.state = 2
-		rf.timer.Reset(getRandTime(0))
+		//rf.timer.Reset(getRandTime(0))
 		return true
 	}
 	checkLog := func() bool {

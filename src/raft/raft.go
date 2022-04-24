@@ -235,12 +235,12 @@ func (rf *Raft) election() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	fmt.Printf("node %v start election\n", rf.me)
 	rf.state = 1
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
 	limit := (len(rf.peers) + 1) / 2
-	support := 0
+	support := 1
+	fmt.Printf("node %v start election in term %v\n", rf.me, rf.currentTerm)
 
 	reply := new(RequestVoteReply)
 	lastLog := rf.entries.getLastEntry()
@@ -255,7 +255,25 @@ func (rf *Raft) election() {
 		if node == rf.me {
 			continue
 		}
-		ok := rf.sendRequestVote(node, arg, reply)
+
+		t := time.After(SendWaitTimeout)
+		isSend := make(chan bool, 1)
+		go func() {
+			ok := rf.sendRequestVote(node, arg, reply)
+			isSend <- ok
+		}()
+		select {
+		case ok := <-isSend:
+			if !ok {
+				fmt.Printf("node %v(term %v) request node %v, get reply fail\n", rf.me, rf.currentTerm, node)
+				continue
+			}
+			break
+		case <- t:
+			fmt.Printf("node %v sendRequestVote to node %v timeout in term %v\n", rf.me, node, rf.currentTerm)
+			continue
+		}
+
 		if reply.VoteGranted {
 			support++
 		}
@@ -263,10 +281,10 @@ func (rf *Raft) election() {
 			fmt.Printf("node %v's term(%v) is bigger than candidate %v's term(%v)\n", node, reply.Term, rf.me, rf.currentTerm)
 			rf.currentTerm = reply.Term
 			rf.state = 2
-			rf.timer.Reset(getRandTime(0))
+			//rf.timer.Reset(getRandTime(0))
 			return
 		}
-		fmt.Printf("node %v(term %v) request node %v, get reply isok(%v): %v, %v\n", rf.me, rf.currentTerm, node, ok, reply.Term, reply.VoteGranted)
+		fmt.Printf("node %v(term %v) request node %v, get reply: %v, %v\n", rf.me, rf.currentTerm, node, reply.Term, reply.VoteGranted)
 	}
 	if support >= limit {
 		rf.state = 0
@@ -275,7 +293,7 @@ func (rf *Raft) election() {
 		return
 	}
 	rf.state = 2
-	rf.timer.Reset(getRandTime(0))
+	//rf.timer.Reset(getRandTime(0))
 	fmt.Printf("node %v loses in term %v election\n", rf.me, rf.currentTerm)
 }
 
@@ -288,6 +306,7 @@ func (rf *Raft) life() {
 		case <-rf.timer.C:
 			go func() {
 				rf.election()
+				rf.timer.Reset(getRandTime(0))
 			}()
 		default:
 
