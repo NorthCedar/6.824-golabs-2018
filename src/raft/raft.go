@@ -17,7 +17,11 @@ package raft
 //   in the same server.
 //
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+	"time"
+)
 import "labrpc"
 
 // import "bytes"
@@ -46,7 +50,7 @@ type ApplyMsg struct {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu        sync.RWMutex        // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -54,16 +58,37 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	// need persisted
+	currentTerm 		int
+	votedFor 			int
+	entries 			*Entries
 
+	// all servers
+	commitIndex 		int
+	lastApplied 		int
+
+	// leader
+	nextIndex			[]int
+	matchIndex			[]int
+
+	endCh 				chan bool
+	state 				int
+	timer 				*time.Timer
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
 	var term int
 	var isleader bool
+
 	// Your code here (2A).
+	term = rf.currentTerm
+	isleader = rf.state == 0
+	fmt.Printf("Get %v State = %v, term = %v \n", rf.me, rf.state, rf.currentTerm)
+
 	return term, isleader
 }
 
@@ -108,66 +133,6 @@ func (rf *Raft) readPersist(data []byte) {
 }
 
 
-
-
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-}
-
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
-type RequestVoteReply struct {
-	// Your data here (2A).
-}
-
-//
-// example RequestVote RPC handler.
-//
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
-}
-
-//
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-//
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
-}
-
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -183,14 +148,75 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	fmt.Printf("node %v start with command %v\n", rf.me, command)
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
+
+	index := 0
+	term := rf.currentTerm
+	lastEntry := rf.entries.getLastEntry()
+	if lastEntry.term == rf.currentTerm {
+		index = lastEntry.index + 1
+	}
+	isLeader := rf.state == 0
 
 	// Your code here (2B).
+	if !isLeader {
+		return index, term, isLeader
+	}
 
+	go func(command interface{}) {
+		defer func() {
+			if err := recover(); err!= nil {
+				fmt.Println("get panic in Make: ", err)
+			}
+		}()
+		rf.appendOnly(command)
+		go rf.tryCommit()
+	}(command)
 
 	return index, term, isLeader
+}
+
+func (rf *Raft) tryCommit() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	readyNodes := 0
+	for node, startIndex := range rf.nextIndex {
+		if node == rf.me {
+			continue
+		}
+		
+		reply := new(AppendEntriesReply)
+		prevLog, es := rf.entries.getPrevEntry(startIndex)
+		args := &AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: prevLog.index,
+			PrevLogTerm:  prevLog.term,
+			Entries:      es,
+			LeaderCommit: 0,
+		}
+		rf.sendAppendEntries(node, args, reply)
+		if reply.Term > rf.currentTerm {
+			fmt.Printf("node %v's term(%v) is bigger than leader %v's term(%v)\n", node, reply.Term, rf.me, rf.currentTerm)
+			rf.currentTerm = reply.Term
+			rf.state = 2
+			rf.timer.Reset(getRandTime(0))
+			return
+		}
+		if reply.Success {
+			readyNodes++
+			rf.matchIndex[node] = rf.entries.index
+			rf.nextIndex[node] = rf.entries.index+1
+		}else {
+			rf.nextIndex[node]--
+		}
+	}
+	if readyNodes >= (len(rf.peers) + 1) / 2 {
+		rf.commitIndex  = rf.entries.index
+	}
 }
 
 //
@@ -201,6 +227,73 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+	close(rf.endCh)
+	return
+}
+
+func (rf *Raft) election() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	fmt.Printf("node %v start election\n", rf.me)
+	rf.state = 1
+	rf.currentTerm += 1
+	rf.votedFor = rf.me
+	limit := (len(rf.peers) + 1) / 2
+	support := 0
+
+	reply := new(RequestVoteReply)
+	lastLog := rf.entries.getLastEntry()
+	arg := &RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: lastLog.term,
+		LastLogTerm:  lastLog.index,
+	}
+
+	for node := range rf.peers {
+		if node == rf.me {
+			continue
+		}
+		ok := rf.sendRequestVote(node, arg, reply)
+		if reply.VoteGranted {
+			support++
+		}
+		if reply.Term > rf.currentTerm {
+			fmt.Printf("node %v's term(%v) is bigger than candidate %v's term(%v)\n", node, reply.Term, rf.me, rf.currentTerm)
+			rf.currentTerm = reply.Term
+			rf.state = 2
+			rf.timer.Reset(getRandTime(0))
+			return
+		}
+		fmt.Printf("node %v(term %v) request node %v, get reply isok(%v): %v, %v\n", rf.me, rf.currentTerm, node, ok, reply.Term, reply.VoteGranted)
+	}
+	if support >= limit {
+		rf.state = 0
+		rf.initLeader()
+		fmt.Printf("node %v wins in term %v election\n", rf.me, rf.currentTerm)
+		return
+	}
+	rf.state = 2
+	rf.timer.Reset(getRandTime(0))
+	fmt.Printf("node %v loses in term %v election\n", rf.me, rf.currentTerm)
+}
+
+func (rf *Raft) life() {
+	for {
+		select {
+		case <-rf.endCh:
+			fmt.Printf("stop service %v\n", rf.me)
+			return
+		case <-rf.timer.C:
+			go func() {
+				rf.election()
+			}()
+		default:
+
+		}
+
+	}
 }
 
 //
@@ -222,10 +315,28 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.votedFor = -1
+	rf.currentTerm = 0
+	rf.entries = newEntry()
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.nextIndex = make([]int, 0)
+	rf.matchIndex = make([]int, 0)
+	rf.endCh = make(chan bool, 1)
+	rf.state = 2
+	rf.timer = time.NewTimer(getRandTime(0))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	go func() {
+		defer func() {
+			if err := recover(); err!= nil {
+				fmt.Println("get panic in Make: ", err)
+			}
+		}()
+		rf.life()
+	}()
 
 	return rf
 }
