@@ -54,6 +54,7 @@ type Raft struct {
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
+	applyCh   chan ApplyMsg
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -152,12 +153,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.RLock()
 	defer rf.mu.RUnlock()
 
-	index := 0
+	index := rf.entries.index
 	term := rf.currentTerm
-	lastEntry := rf.entries.getLastEntry()
-	if lastEntry.term == rf.currentTerm {
-		index = lastEntry.index + 1
-	}
 	isLeader := rf.state == 0
 
 	// Your code here (2B).
@@ -166,22 +163,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	go func(command interface{}) {
-		defer func() {
-			if err := recover(); err!= nil {
-				fmt.Println("get panic in Make: ", err)
-			}
-		}()
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
 		rf.appendOnly(command)
-		go rf.tryCommit()
+		rf.tryCommit()
 	}(command)
 
 	return index, term, isLeader
 }
 
 func (rf *Raft) tryCommit() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
+	if rf.state != 0 {
+		return
+	}
 	readyNodes := 0
 	for node, startIndex := range rf.nextIndex {
 		if node == rf.me {
@@ -193,30 +187,51 @@ func (rf *Raft) tryCommit() {
 		args := &AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
-			PrevLogIndex: prevLog.index,
-			PrevLogTerm:  prevLog.term,
+			PrevLogIndex: prevLog.Index,
+			PrevLogTerm:  prevLog.Term,
 			Entries:      es,
-			LeaderCommit: 0,
+			LeaderCommit: rf.commitIndex,
 		}
-		rf.sendAppendEntries(node, args, reply)
+
+		ok := rf.sendAppendEntries(node, args, reply)
+		if !ok {
+			continue
+		}
+
 		if reply.Term > rf.currentTerm {
 			fmt.Printf("node %v's term(%v) is bigger than leader %v's term(%v)\n", node, reply.Term, rf.me, rf.currentTerm)
 			rf.currentTerm = reply.Term
 			rf.state = 2
-			rf.timer.Reset(getRandTime(0))
+			rf.timer.Reset(getRandTime(rf.me))
 			return
 		}
 		if reply.Success {
 			readyNodes++
 			rf.matchIndex[node] = rf.entries.index
 			rf.nextIndex[node] = rf.entries.index+1
-		}else {
+		}else if rf.nextIndex[node] > 1 {
 			rf.nextIndex[node]--
 		}
 	}
-	if readyNodes >= (len(rf.peers) + 1) / 2 {
-		rf.commitIndex  = rf.entries.index
+
+	if readyNodes >= (len(rf.peers) + 1) / 2 && rf.commitIndex != rf.entries.index {
+		last := rf.entries.getLastEntry()
+		if last.Term != rf.currentTerm {
+			fmt.Printf("leader cannot commit other term log")
+			rf.timer.Reset(BeatTimeout)
+			return
+		}
+
+		rf.commitIndex = rf.entries.index
+		rf.applyCh <- ApplyMsg{
+			CommandValid: true,
+			Command:      last.Command,
+			CommandIndex: rf.commitIndex-1,
+		}
+		fmt.Printf("tryCommit： leader node %v commit to %v(%v-%v) ok\n", rf.me, rf.commitIndex, last.Term, last.Index)
 	}
+
+	rf.timer.Reset(BeatTimeout)
 }
 
 //
@@ -232,9 +247,6 @@ func (rf *Raft) Kill() {
 }
 
 func (rf *Raft) election() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	rf.state = 1
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
@@ -247,8 +259,8 @@ func (rf *Raft) election() {
 	arg := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: lastLog.term,
-		LastLogTerm:  lastLog.index,
+		LastLogIndex: lastLog.Index,
+		LastLogTerm:  lastLog.Term,
 	}
 
 	for node := range rf.peers {
@@ -256,21 +268,8 @@ func (rf *Raft) election() {
 			continue
 		}
 
-		t := time.After(SendWaitTimeout)
-		isSend := make(chan bool, 1)
-		go func() {
-			ok := rf.sendRequestVote(node, arg, reply)
-			isSend <- ok
-		}()
-		select {
-		case ok := <-isSend:
-			if !ok {
-				fmt.Printf("node %v(term %v) request node %v, get reply fail\n", rf.me, rf.currentTerm, node)
-				continue
-			}
-			break
-		case <- t:
-			fmt.Printf("node %v sendRequestVote to node %v timeout in term %v\n", rf.me, node, rf.currentTerm)
+		ok := rf.sendRequestVote(node, arg, reply)
+		if !ok {
 			continue
 		}
 
@@ -281,19 +280,20 @@ func (rf *Raft) election() {
 			fmt.Printf("node %v's term(%v) is bigger than candidate %v's term(%v)\n", node, reply.Term, rf.me, rf.currentTerm)
 			rf.currentTerm = reply.Term
 			rf.state = 2
-			//rf.timer.Reset(getRandTime(0))
+			rf.timer.Reset(getRandTime(rf.me))
 			return
 		}
 		fmt.Printf("node %v(term %v) request node %v, get reply: %v, %v\n", rf.me, rf.currentTerm, node, reply.Term, reply.VoteGranted)
 	}
 	if support >= limit {
+		fmt.Printf("node %v wins in term %v election\n", rf.me, rf.currentTerm)
 		rf.state = 0
 		rf.initLeader()
-		fmt.Printf("node %v wins in term %v election\n", rf.me, rf.currentTerm)
+		rf.tryCommit()
 		return
 	}
 	rf.state = 2
-	//rf.timer.Reset(getRandTime(0))
+	rf.timer.Reset(getRandTime(rf.me))
 	fmt.Printf("node %v loses in term %v election\n", rf.me, rf.currentTerm)
 }
 
@@ -304,14 +304,22 @@ func (rf *Raft) life() {
 			fmt.Printf("stop service %v\n", rf.me)
 			return
 		case <-rf.timer.C:
-			go func() {
-				rf.election()
-				rf.timer.Reset(getRandTime(0))
-			}()
+			go rf.handleTimeOut()
 		default:
 
 		}
 
+	}
+}
+
+func (rf *Raft) handleTimeOut() {
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
+
+	if rf.state == 0 {
+		rf.tryCommit()
+	}else {
+		rf.election()
 	}
 }
 
@@ -332,18 +340,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.votedFor = -1
 	rf.currentTerm = 0
 	rf.entries = newEntry()
-	rf.commitIndex = 0
-	rf.lastApplied = 0
+	rf.commitIndex = 1
+	rf.lastApplied = 1
 	rf.nextIndex = make([]int, 0)
 	rf.matchIndex = make([]int, 0)
 	rf.endCh = make(chan bool, 1)
 	rf.state = 2
-	rf.timer = time.NewTimer(getRandTime(0))
+	rf.timer = time.NewTimer(getRandTime(rf.me))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

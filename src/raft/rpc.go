@@ -1,6 +1,9 @@
 package raft
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 //
 // example RequestVote RPC arguments structure.
@@ -35,25 +38,28 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term <= rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
+		fmt.Printf("node %v(%v) handle node %v(%v)'s RequestVote fail: check term error\n", rf.me, rf.currentTerm, args.CandidateId, args.Term)
 		return
 	}
 
 	lastLog := rf.entries.getLastEntry()
-	lastLogTerm := lastLog.term
-	lastLogIndex := lastLog.index
+	lastLogTerm := lastLog.Term
+	lastLogIndex := lastLog.Index
 	if args.LastLogTerm < lastLogTerm ||
 		(args.LastLogTerm == lastLogTerm && args.LastLogIndex < lastLogIndex){
+		fmt.Printf("node %v(%v) handle node %v(%v)'s RequestVote fail: check log error: self(%v-%v) candidate(%v-%v)\n", rf.me, rf.currentTerm, args.CandidateId, args.Term, lastLogTerm, lastLogIndex, args.LastLogTerm, args.LastLogIndex)
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
 	}
 
 	rf.state = 2
-	//rf.timer.Reset(getRandTime(0))
+	rf.timer.Reset(getRandTime(rf.me))
 	rf.currentTerm = args.Term
 	rf.votedFor = args.CandidateId
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = true
+	fmt.Printf("node %v(%v) handle node %v(%v)'s RequestVote ok\n", rf.me, rf.currentTerm, args.CandidateId, args.Term)
 	return
 }
 
@@ -87,7 +93,23 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	t := time.After(SendWaitTimeout)
+	isSend := make(chan bool, 1)
+	go func() {
+		ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+		isSend <- ok
+	}()
+	var ok bool
+	select {
+	case ok = <-isSend:
+		if !ok {
+			fmt.Printf("node %v(term %v) request node %v, get reply fail\n", rf.me, rf.currentTerm, server)
+		}
+		break
+	case <- t:
+		fmt.Printf("node %v sendRequestVote to node %v timeout in term %v\n", rf.me, server, rf.currentTerm)
+	}
+
 	return ok
 }
 
@@ -107,7 +129,24 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	t := time.After(SendWaitTimeout)
+	isSend := make(chan bool, 1)
+	var ok bool
+	go func() {
+		isOk := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+		isSend <- isOk
+	}()
+	select {
+	case ok = <-isSend:
+		if !ok {
+			fmt.Printf("node %v(term %v) request node %v, get reply fail\n", rf.me, rf.currentTerm, server)
+		}
+		break
+	case <- t:
+		fmt.Printf("node %v sendRequestVote to node %v timeout in term %v\n", rf.me, server, rf.currentTerm)
+		ok = false
+	}
+
 	return ok
 }
 
@@ -125,12 +164,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.votedFor = args.LeaderId
 		reply.Term = rf.currentTerm
 		rf.state = 2
-		//rf.timer.Reset(getRandTime(0))
+		rf.timer.Reset(getRandTime(rf.me))
 		return true
 	}
 	checkLog := func() bool {
 		lastLog := rf.entries.getLastEntry()
-		if args.PrevLogTerm > lastLog.term {
+		if args.PrevLogTerm > lastLog.Term {
 			return false
 		}
 		if args.PrevLogIndex > len(rf.entries.entries[args.PrevLogTerm])-1 {
@@ -140,7 +179,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	reply.Success = checkState() && checkLog()
-	rf.commitIndex = args.LeaderCommit
+	if !reply.Success {
+		return
+	}
+
+	if rf.commitIndex != args.LeaderCommit {
+		rf.commitIndex = args.LeaderCommit
+		last := rf.entries.getLastEntry()
+		rf.applyCh <- ApplyMsg{
+			CommandValid: true,
+			Command:      last.Command,
+			CommandIndex: rf.commitIndex-1,
+		}
+		fmt.Printf("node %v follows leader %v commit to %v\n", rf.me, args.LeaderId, rf.commitIndex)
+	}else {
+		fmt.Printf("node %v receives leader %v's beat\n", rf.me, args.LeaderId)
+	}
 
 	go rf.appendEntry(args)
 	return

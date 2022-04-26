@@ -2,6 +2,7 @@ package raft
 
 import (
 	rand2 "crypto/rand"
+	"fmt"
 	"log"
 	"math/big"
 	"time"
@@ -23,9 +24,9 @@ type Entries struct {
 }
 
 type Entry struct {
-	term 		int
-	index 		int
-	command 	interface{}
+	Term 		int
+	Index 		int
+	Command 	interface{}
 }
 
 func newEntry() *Entries {
@@ -35,9 +36,9 @@ func newEntry() *Entries {
 	}
 	res.entries[0] = make([]*Entry, 1)
 	res.entries[0][0] = &Entry{
-		term:    0,
-		index:   0,
-		command: nil,
+		Term:    0,
+		Index:   0,
+		Command: nil,
 	}
 	return res
 }
@@ -48,13 +49,17 @@ func (es *Entries) getLastEntry() *Entry {
 }
 
 func (es *Entries) getPrevEntry(nowIndex int) (*Entry, []*Entry) {
-	if nowIndex > es.index {
-		panic("something wrong")
-	}
-	res := make([]*Entry, 0)
-	step := es.index - nowIndex + 1
 	lastLog := es.getLastEntry()
-	for i := lastLog.term; i>=0; i-- {
+	res := make([]*Entry, 0)
+	if nowIndex > es.index {
+		if nowIndex - es.index > 1 {
+			panic("something wrong")
+		}
+		return lastLog, res
+	}
+
+	step := es.index - nowIndex + 1
+	for i := lastLog.Term; i>=0; i-- {
 		for j := len(es.entries[i])-1; j>=0; j-- {
 			if step == 0 {
 				return es.entries[i][j], res
@@ -64,13 +69,16 @@ func (es *Entries) getPrevEntry(nowIndex int) (*Entry, []*Entry) {
 		}
 	}
 
-	panic("something wrong")
+	if step == 0 {
+		return es.entries[0][0], res
+	}
+	panic("something wrong" + fmt.Sprintf("es.index %v, nowIndex %v", es.index, nowIndex))
 	return nil, nil
 }
 
 func (es *Entries)delete(endTerm, endIndex int) {
 	lastLog := es.getLastEntry()
-	nowTerm := lastLog.term
+	nowTerm := lastLog.Term
 	for nowTerm > endTerm {
 		es.index -= len(es.entries[nowTerm])
 		es.entries = es.entries[:nowTerm]
@@ -88,32 +96,32 @@ func (es *Entries)delete(endTerm, endIndex int) {
 
 func (es *Entries)addEntry(e *Entry) {
 	lastLog := es.getLastEntry()
-	nowTerm := lastLog.term
+	nowTerm := lastLog.Term
 
-	for ; nowTerm < e.term; {
+	for ; nowTerm < e.Term; {
 		es.entries = append(es.entries, []*Entry{})
 		nowTerm++
 	}
-	nowTerm = e.term
+	nowTerm = e.Term
 
 	nowIndex := len(es.entries[nowTerm])-1
-	for ; nowIndex < e.index; {
+	for ; nowIndex < e.Index; {
 		es.entries[nowTerm] = append(es.entries[nowTerm], &Entry{})
 		nowIndex++
 		es.index++
 	}
-	nowIndex = e.index
+	nowIndex = e.Index
 
 	es.entries[nowTerm][nowIndex] = &Entry{
-		term:    e.term,
-		index:   e.index,
-		command: e.command,
+		Term:    e.Term,
+		Index:   e.Index,
+		Command: e.Command,
 	}
 }
 
 func (es *Entries) appendOnly(command interface{}, currentTerm int) {
 	lastLog := es.getLastEntry()
-	nowTerm := lastLog.term
+	nowTerm := lastLog.Term
 	for nowTerm < currentTerm  {
 		es.entries = append(es.entries, []*Entry{})
 		nowTerm++
@@ -121,19 +129,20 @@ func (es *Entries) appendOnly(command interface{}, currentTerm int) {
 	nowTerm = currentTerm
 
 	es.entries[nowTerm] = append(es.entries[nowTerm], &Entry{
-		term:    nowTerm,
-		index:   len(es.entries[nowTerm]),
-		command: command,
+		Term:    nowTerm,
+		Index:   len(es.entries[nowTerm]),
+		Command: command,
 	})
 	es.index++
 }
 
-const beatTime = 200
-const SendWaitTimeout = 100 * time.Millisecond
-func getRandTime(i int) time.Duration {
+const BeatTimeout = 100 *time.Millisecond
+const BasicWaitTimeout = 200 *time.Millisecond
+const SendWaitTimeout = 10 * time.Millisecond
+func getRandTime(node int) time.Duration {
 	rng, _ := rand2.Int(rand2.Reader, big.NewInt(200))
-	tmp := uint32(rng.Uint64())
-	tmp += beatTime
-	tmp += uint32(i)
-	return time.Duration(tmp) * time.Millisecond
+	tmp := time.Duration(rng.Uint64()) * time.Millisecond
+	tmp += BasicWaitTimeout
+	fmt.Printf("reset timer - %v\n", node)
+	return tmp
 }
