@@ -19,8 +19,8 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 type Entries struct {
-	entries 	[][]*Entry
-	index 		int
+	entries 	[]*Entry
+	cap 		int
 }
 
 type Entry struct {
@@ -31,11 +31,10 @@ type Entry struct {
 
 func newEntry() *Entries {
 	res := &Entries{
-		entries: make([][]*Entry, 1),
-		index:   1,
+		entries: make([]*Entry, 1),
+		cap:   1,
 	}
-	res.entries[0] = make([]*Entry, 1)
-	res.entries[0][0] = &Entry{
+	res.entries[0] = &Entry{
 		Term:    0,
 		Index:   0,
 		Command: nil,
@@ -44,101 +43,74 @@ func newEntry() *Entries {
 }
 
 func (es *Entries) getLastEntry() *Entry {
-	lastTerm := es.entries[len(es.entries)-1]
-	return lastTerm[len(lastTerm)-1]
+	return es.entries[es.cap-1]
+}
+
+func (es *Entries) addToApplyCh(prevCommit, nowCommit int, applyCh chan ApplyMsg) {
+	//fmt.Printf("addToApplyCh prevCommit %v, nowCommit %v\n", prevCommit, nowCommit)
+	for i:= prevCommit+1; i <= nowCommit; i++ {
+		applyCh <- ApplyMsg{
+			CommandValid: true,
+			Command:      es.entries[i].Command,
+			CommandIndex: i,
+		}
+		//fmt.Printf("apply %v\n", es.entries[i].Command)
+	}
 }
 
 func (es *Entries) getPrevEntry(nowIndex int) (*Entry, []*Entry) {
-	lastLog := es.getLastEntry()
-	res := make([]*Entry, 0)
-	if nowIndex > es.index {
-		if nowIndex - es.index > 1 {
-			panic("something wrong")
-		}
-		return lastLog, res
+	if nowIndex-1 >= es.cap || nowIndex == 0 {
+		panic("something wrong")
 	}
-
-	step := es.index - nowIndex + 1
-	for i := lastLog.Term; i>=0; i-- {
-		for j := len(es.entries[i])-1; j>=0; j-- {
-			if step == 0 {
-				return es.entries[i][j], res
-			}
-			res = append(res, es.entries[i][j])
-			step--
-		}
-	}
-
-	if step == 0 {
-		return es.entries[0][0], res
-	}
-	panic("something wrong" + fmt.Sprintf("es.index %v, nowIndex %v", es.index, nowIndex))
-	return nil, nil
+	return es.entries[nowIndex-1], es.entries[nowIndex:es.cap]
 }
 
 func (es *Entries)delete(endTerm, endIndex int) {
 	lastLog := es.getLastEntry()
-	nowTerm := lastLog.Term
-	for nowTerm > endTerm {
-		es.index -= len(es.entries[nowTerm])
-		es.entries = es.entries[:nowTerm]
-		nowTerm--
-	}
-	nowTerm = endTerm
-
-	nowIndex := len(es.entries[nowTerm])-1
-	for nowIndex > endIndex {
-		es.entries[nowTerm] = es.entries[nowTerm][:nowIndex]
-		nowIndex--
-		es.index--
+	for lastLog.Term > endTerm || (lastLog.Term == endTerm && lastLog.Index > endIndex) {
+		es.cap--
+		lastLog = es.getLastEntry()
 	}
 }
 
-func (es *Entries)addEntry(e *Entry) {
+func (es *Entries)findEntry(term, index int) (bool, int) {
 	lastLog := es.getLastEntry()
-	nowTerm := lastLog.Term
-
-	for ; nowTerm < e.Term; {
-		es.entries = append(es.entries, []*Entry{})
-		nowTerm++
+	now := es.cap-1
+	for lastLog.Term != term || lastLog.Index != index {
+		if now == 0 || lastLog.Term < term{
+			return false, 0
+		}
+		now--
+		lastLog = es.entries[now]
 	}
-	nowTerm = e.Term
+	return true, now
+}
 
-	nowIndex := len(es.entries[nowTerm])-1
-	for ; nowIndex < e.Index; {
-		es.entries[nowTerm] = append(es.entries[nowTerm], &Entry{})
-		nowIndex++
-		es.index++
+func (es *Entries)addEntry(e *Entry) {
+	if len(es.entries) <= es.cap {
+		es.entries = append(es.entries, make([]*Entry, es.cap)...)
 	}
-	nowIndex = e.Index
-
-	es.entries[nowTerm][nowIndex] = &Entry{
-		Term:    e.Term,
-		Index:   e.Index,
-		Command: e.Command,
-	}
+	es.entries[es.cap] = e
+	es.cap++
 }
 
 func (es *Entries) appendOnly(command interface{}, currentTerm int) {
 	lastLog := es.getLastEntry()
-	nowTerm := lastLog.Term
-	for nowTerm < currentTerm  {
-		es.entries = append(es.entries, []*Entry{})
-		nowTerm++
+	nowIndex := 0
+	if lastLog.Term == currentTerm {
+		nowIndex = lastLog.Index+1
 	}
-	nowTerm = currentTerm
-
-	es.entries[nowTerm] = append(es.entries[nowTerm], &Entry{
-		Term:    nowTerm,
-		Index:   len(es.entries[nowTerm]),
+	e := &Entry{
+		Term:    currentTerm,
+		Index:   nowIndex,
 		Command: command,
-	})
-	es.index++
+	}
+	es.addEntry(e)
 }
 
 const BeatTimeout = 100 *time.Millisecond
-const BasicWaitTimeout = 200 *time.Millisecond
-const SendWaitTimeout = 10 * time.Millisecond
+const BasicWaitTimeout = 300 *time.Millisecond
+const SendWaitTimeout = 30 * time.Millisecond
 func getRandTime(node int) time.Duration {
 	rng, _ := rand2.Int(rand2.Reader, big.NewInt(200))
 	tmp := time.Duration(rng.Uint64()) * time.Millisecond

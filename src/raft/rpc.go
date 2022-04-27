@@ -42,6 +42,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	rf.currentTerm = args.Term
 	lastLog := rf.entries.getLastEntry()
 	lastLogTerm := lastLog.Term
 	lastLogIndex := lastLog.Index
@@ -55,7 +56,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	rf.state = 2
 	rf.timer.Reset(getRandTime(rf.me))
-	rf.currentTerm = args.Term
 	rf.votedFor = args.CandidateId
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = true
@@ -139,11 +139,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	select {
 	case ok = <-isSend:
 		if !ok {
-			fmt.Printf("node %v(term %v) request node %v, get reply fail\n", rf.me, rf.currentTerm, server)
+			//fmt.Printf("node %v(term %v) request node %v, get reply fail\n", rf.me, rf.currentTerm, server)
 		}
 		break
 	case <- t:
-		fmt.Printf("node %v sendRequestVote to node %v timeout in term %v\n", rf.me, server, rf.currentTerm)
+		//fmt.Printf("node %v sendAppendEntries to node %v timeout in term %v\n", rf.me, server, rf.currentTerm)
 		ok = false
 	}
 
@@ -168,14 +168,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return true
 	}
 	checkLog := func() bool {
-		lastLog := rf.entries.getLastEntry()
-		if args.PrevLogTerm > lastLog.Term {
-			return false
-		}
-		if args.PrevLogIndex > len(rf.entries.entries[args.PrevLogTerm])-1 {
-			return false
-		}
-		return true
+		isExist, _ := rf.entries.findEntry(args.PrevLogTerm, args.PrevLogIndex)
+		return isExist
 	}
 
 	reply.Success = checkState() && checkLog()
@@ -183,19 +177,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	rf.appendEntry(args)
 	if rf.commitIndex != args.LeaderCommit {
-		rf.commitIndex = args.LeaderCommit
-		last := rf.entries.getLastEntry()
-		rf.applyCh <- ApplyMsg{
-			CommandValid: true,
-			Command:      last.Command,
-			CommandIndex: rf.commitIndex-1,
-		}
-		fmt.Printf("node %v follows leader %v commit to %v\n", rf.me, args.LeaderId, rf.commitIndex)
+		fmt.Printf("node %v(%v) follows leader %v(%v) commit to %v\n", rf.me, rf.currentTerm, args.LeaderId, args.Term, args.LeaderCommit)
+		//rf.entries.getPrevEntry(args.LeaderCommit)
 	}else {
-		fmt.Printf("node %v receives leader %v's beat\n", rf.me, args.LeaderId)
+		fmt.Printf("node %v(%v) receives leader %v(%v)'s beat\n", rf.me, rf.currentTerm, args.LeaderId, args.Term)
 	}
 
-	go rf.appendEntry(args)
+	go func(prev, now int, am chan ApplyMsg) {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+
+		rf.entries.addToApplyCh(prev, now, am)
+	}(rf.commitIndex, args.LeaderCommit, rf.applyCh)
+
+	rf.commitIndex = args.LeaderCommit
 	return
 }

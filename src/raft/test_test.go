@@ -344,6 +344,7 @@ func TestBackup2B(t *testing.T) {
 
 	// put leader and one follower in a partition
 	leader1 := cfg.checkOneLeader()
+	fmt.Printf("--------------------------------leader1 %v and  follower %v\n", leader1, (leader1 + 1) % servers)
 	cfg.disconnect((leader1 + 2) % servers)
 	cfg.disconnect((leader1 + 3) % servers)
 	cfg.disconnect((leader1 + 4) % servers)
@@ -359,6 +360,7 @@ func TestBackup2B(t *testing.T) {
 	cfg.disconnect((leader1 + 1) % servers)
 
 	// allow other partition to recover
+	fmt.Printf("--------------------------------other part %v %v %v\n", (leader1 + 2) % servers, (leader1 + 3) % servers, (leader1 + 4) % servers)
 	cfg.connect((leader1 + 2) % servers)
 	cfg.connect((leader1 + 3) % servers)
 	cfg.connect((leader1 + 4) % servers)
@@ -370,6 +372,7 @@ func TestBackup2B(t *testing.T) {
 
 	// now another partitioned leader and one follower
 	leader2 := cfg.checkOneLeader()
+	fmt.Printf("--------------------------------leader2 %v\n", leader2)
 	other := (leader1 + 2) % servers
 	if leader2 == other {
 		other = (leader2 + 1) % servers
@@ -387,6 +390,7 @@ func TestBackup2B(t *testing.T) {
 	for i := 0; i < servers; i++ {
 		cfg.disconnect(i)
 	}
+	fmt.Printf("--------------------------------part2 long-log(%v) %v %v\n", other, (leader1 + 0) % servers, (leader1 + 1) % servers)
 	cfg.connect((leader1 + 0) % servers)
 	cfg.connect((leader1 + 1) % servers)
 	cfg.connect(other)

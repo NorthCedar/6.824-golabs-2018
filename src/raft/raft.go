@@ -153,7 +153,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.RLock()
 	defer rf.mu.RUnlock()
 
-	index := rf.entries.index
+	index := rf.entries.cap
 	term := rf.currentTerm
 	isLeader := rf.state == 0
 
@@ -161,11 +161,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if !isLeader {
 		return index, term, isLeader
 	}
+	rf.appendOnly(command)
 
 	go func(command interface{}) {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		rf.appendOnly(command)
+		if rf.state != 0 {
+			return
+		}
 		rf.tryCommit()
 	}(command)
 
@@ -173,10 +176,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 }
 
 func (rf *Raft) tryCommit() {
-	if rf.state != 0 {
-		return
-	}
-	readyNodes := 0
+	limit := (len(rf.peers) + 1) / 2
+	readyNodes := 1
 	for node, startIndex := range rf.nextIndex {
 		if node == rf.me {
 			continue
@@ -207,27 +208,37 @@ func (rf *Raft) tryCommit() {
 		}
 		if reply.Success {
 			readyNodes++
-			rf.matchIndex[node] = rf.entries.index
-			rf.nextIndex[node] = rf.entries.index+1
+			rf.matchIndex[node] = rf.entries.cap-1
+			rf.nextIndex[node] = rf.entries.cap
 		}else if rf.nextIndex[node] > 1 {
-			rf.nextIndex[node]--
+			if rf.entries.cap - rf.nextIndex[node] > 5 {
+				if rf.nextIndex[node] - 10 >= 1 {
+					rf.nextIndex[node] -= 10
+				}else {
+					rf.nextIndex[node] = 1
+				}
+			}else {
+				rf.nextIndex[node]--
+			}
 		}
 	}
 
-	if readyNodes >= (len(rf.peers) + 1) / 2 && rf.commitIndex != rf.entries.index {
+	if readyNodes >= limit && rf.commitIndex != rf.entries.cap-1 {
 		last := rf.entries.getLastEntry()
 		if last.Term != rf.currentTerm {
-			fmt.Printf("leader cannot commit other term log")
+			fmt.Printf("leader cannot commit other term log\n")
 			rf.timer.Reset(BeatTimeout)
 			return
 		}
 
-		rf.commitIndex = rf.entries.index
-		rf.applyCh <- ApplyMsg{
-			CommandValid: true,
-			Command:      last.Command,
-			CommandIndex: rf.commitIndex-1,
-		}
+		go func(prev, now int, am chan ApplyMsg) {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			rf.entries.addToApplyCh(prev, now, am)
+		}(rf.commitIndex, rf.entries.cap-1, rf.applyCh)
+
+		rf.commitIndex = rf.entries.cap-1
 		fmt.Printf("tryCommit： leader node %v commit to %v(%v-%v) ok\n", rf.me, rf.commitIndex, last.Term, last.Index)
 	}
 
@@ -254,7 +265,6 @@ func (rf *Raft) election() {
 	support := 1
 	fmt.Printf("node %v start election in term %v\n", rf.me, rf.currentTerm)
 
-	reply := new(RequestVoteReply)
 	lastLog := rf.entries.getLastEntry()
 	arg := &RequestVoteArgs{
 		Term:         rf.currentTerm,
@@ -268,6 +278,8 @@ func (rf *Raft) election() {
 			continue
 		}
 
+		reply := new(RequestVoteReply)
+		reply.VoteGranted = false
 		ok := rf.sendRequestVote(node, arg, reply)
 		if !ok {
 			continue
@@ -304,7 +316,12 @@ func (rf *Raft) life() {
 			fmt.Printf("stop service %v\n", rf.me)
 			return
 		case <-rf.timer.C:
-			go rf.handleTimeOut()
+			go func() {
+				rf.mu.RLock()
+				defer rf.mu.RUnlock()
+
+				rf.handleTimeOut()
+			}()
 		default:
 
 		}
@@ -313,9 +330,6 @@ func (rf *Raft) life() {
 }
 
 func (rf *Raft) handleTimeOut() {
-	rf.mu.RLock()
-	defer rf.mu.RUnlock()
-
 	if rf.state == 0 {
 		rf.tryCommit()
 	}else {
@@ -346,8 +360,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.currentTerm = 0
 	rf.entries = newEntry()
-	rf.commitIndex = 1
-	rf.lastApplied = 1
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 	rf.nextIndex = make([]int, 0)
 	rf.matchIndex = make([]int, 0)
 	rf.endCh = make(chan bool, 1)
